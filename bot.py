@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from datetime import time as dtime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ChatType
@@ -137,6 +138,32 @@ def parse_time(text, tz):
             dt += timedelta(days=1)
         return dt
     return None
+
+
+def parse_hhmm(text):
+    """解析每日时间：20:30 / 2030 / 930 / 20，返回 'HH:MM'，格式不对返回 None。"""
+    t = text.strip().replace("：", ":")
+    try:
+        if ":" in t:
+            h, m = (int(x) for x in t.split(":", 1))
+        elif t.isdigit() and len(t) in (3, 4):
+            h, m = int(t[:-2]), int(t[-2:])
+        elif t.isdigit() and len(t) <= 2:
+            h, m = int(t), 0
+        else:
+            return None
+    except ValueError:
+        return None
+    if 0 <= h <= 23 and 0 <= m <= 59:
+        return f"{h:02d}:{m:02d}"
+    return None
+
+
+def register_daily(job_queue, jid, hhmm, offset):
+    """注册每日任务。把本地时间换算成 UTC 钟点，避免时区对象兼容问题。"""
+    h, m = (int(x) for x in hhmm.split(":"))
+    total = (h * 60 + m - int(round(offset * 60))) % 1440
+    job_queue.run_daily(scheduled_cb, time=dtime(total // 60, total % 60), name=jid, data=jid)
 
 
 def describe_message(msg):
@@ -325,24 +352,24 @@ async def scheduled_cb(context: ContextTypes.DEFAULT_TYPE):
     job = d["jobs"].get(jid)
     if not job or job["status"] != "pending":
         return
+    daily = job.get("repeat") == "daily"
     job["status"] = "running"
     save_data(d)
-    status = "done"
+    status = "pending" if daily else "done"  # 每日任务发完回到 pending，明天继续
     try:
         report = await do_broadcast(context.bot, job["cid"], job["sid"])
     except Exception:
         logger.exception("定时任务 %s 出错", jid)
         report = "❌ 群发过程出错，请查看日志"
-        status = "failed"
+        status = "pending" if daily else "failed"
     d = load_data()
-    if jid in d["jobs"]:
+    if jid in d["jobs"] and d["jobs"][jid]["status"] == "running":
         d["jobs"][jid]["status"] = status
         save_data(d)
-    drop_temp_script(job["sid"])
-    await notify(
-        context.bot, job.get("report_chat", job["by"]),
-        f"⏰ 定时任务 <code>{jid}</code> 已执行\n\n{report}",
-    )
+    if not daily:
+        drop_temp_script(job["sid"])
+    title = f"🔁 每日任务 <code>{jid}</code>（每天 {job.get('time')}）已执行" if daily else f"⏰ 定时任务 <code>{jid}</code> 已执行"
+    await notify(context.bot, job.get("report_chat", job["by"]), f"{title}\n\n{report}")
 
 
 # ---------- 界面：主菜单 ----------
@@ -362,7 +389,7 @@ async def screen_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = [
         [btn("📢 开始群发", "bc:new")],
         [btn("🗂 群组分类", "bc:cats"), btn("📝 脚本管理", "bc:scripts")],
-        [btn("⏰ 定时任务", "bc:jobs")],
+        [btn("⏰ 定时任务 / 取消定时", "bc:jobs")],
     ]
     await show(update, text, kb(rows))
 
@@ -440,7 +467,9 @@ async def screen_timing(update, context):
         f"脚本：{esc(script['name'])}"
     )
     rows = [
-        [btn("⚡ 马上发送", "bc:go:now"), btn("⏰ 定时发送", "bc:go:later")],
+        [btn("⚡ 马上发送", "bc:go:now")],
+        [btn("🔁 每日定时", "bc:go:daily"), btn("⏰ 单次定时", "bc:go:later")],
+        [btn("🛑 取消定时（查看全部）", "bc:jobs")],
         [btn("⬅ 上一步", f"bc:fc:{flow['cid']}"), btn("🏠 主菜单", "bc:menu")],
     ]
     await show(update, text, kb(rows))
@@ -456,7 +485,10 @@ async def screen_confirm(update, context):
         await screen_main(update, context)
         return
     when = flow.get("when")
-    if when:
+    if flow.get("daily"):
+        when_txt = f"🔁 每天 {flow['daily']}（{fmt_offset(d)}），直到你取消"
+        ok_txt = "✅ 确认每日定时"
+    elif when:
         when_txt = f"⏰ {fmt_dt(datetime.fromisoformat(when))}（{fmt_offset(d)}）"
         ok_txt = "✅ 确认安排"
     else:
@@ -562,17 +594,20 @@ async def screen_jobs(update, context):
     d = load_data()
     pend = sorted(
         ((jid, j) for jid, j in d["jobs"].items() if j["status"] == "pending"),
-        key=lambda x: x[1]["run_at"],
+        key=lambda x: (0, x[1].get("time", "")) if x[1].get("repeat") == "daily" else (1, x[1]["run_at"]),
     )[:20]
     if pend:
-        lines = ["⏰ <b>待执行的定时任务</b>", ""]
+        lines = ["⏰ <b>定时任务</b>", ""]
         for jid, j in pend:
-            t = fmt_dt(datetime.fromisoformat(j["run_at"]))
-            lines.append(f"• <code>{jid}</code> {t}｜{esc(j['cat_name'])} → {esc(j['script_name'])}")
+            if j.get("repeat") == "daily":
+                when_txt = f"🔁 每天 {j['time']}"
+            else:
+                when_txt = fmt_dt(datetime.fromisoformat(j["run_at"]))
+            lines.append(f"• <code>{jid}</code> {when_txt}｜{esc(j['cat_name'])} → {esc(j['script_name'])}")
         text = "\n".join(lines)
     else:
-        text = "⏰ <b>定时任务</b>\n\n（没有待执行的任务）"
-    rows = [[btn(f"🗑 取消 {jid}", f"bc:jc:{jid}")] for jid, _ in pend]
+        text = "⏰ <b>定时任务</b>\n\n（没有定时任务）"
+    rows = [[btn(f"🛑 取消定时 {jid}", f"bc:jc:{jid}")] for jid, _ in pend]
     rows.append([btn("🏠 主菜单", "bc:menu")])
     await show(update, text, kb(rows))
 
@@ -629,6 +664,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             context.user_data.pop("flow", None)
             await show(update, "⏳ 已开始发送，完成后会在这里回报结果。", kb([[btn("🏠 主菜单", "bc:menu")]]))
+        elif p[2] == "daily":
+            d = load_data()
+            script = d["scripts"].get(flow["sid"])
+            if script is None:
+                await screen_main(update, context)
+                return
+            if script.get("temp"):
+                await show(
+                    update,
+                    "⚠️ <b>即兴文案不能做每日定时</b>\n\n每天要重复发同一条内容，所以需要先把它存成脚本。\n"
+                    "请回上一步，点「➕ 新建脚本」存起来，再选每日定时。",
+                    kb([[btn("⬅ 回上一步", f"bc:fc:{flow['cid']}")]]),
+                )
+                return
+            set_await(context, "time_daily", q.message.chat_id)
+            await show(
+                update,
+                f"🔁 <b>每日定时</b>\n\n请输入每天发送的时间（时区 {fmt_offset(d)}）\n\n"
+                "格式：\n<code>20:30</code>\n<code>2030</code>\n\n"
+                "设好后每天这个时间自动群发，想停就在「⏰ 定时任务」里点「🛑 取消定时」。",
+                kb([[btn("❌ 取消", "bc:menu")]]),
+            )
         else:
             d = load_data()
             set_await(context, "time", q.message.chat_id)
@@ -644,7 +701,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if (not flow or flow["cid"] not in d["categories"] or flow["sid"] not in d["scripts"]):
             await screen_main(update, context)
             return
-        if flow.get("when") is None:
+        if flow.get("daily"):
+            hhmm = flow["daily"]
+            jid = new_id(d, "j")
+            d["jobs"][jid] = {
+                "cid": flow["cid"],
+                "sid": flow["sid"],
+                "cat_name": d["categories"][flow["cid"]]["name"],
+                "script_name": d["scripts"][flow["sid"]]["name"],
+                "repeat": "daily",
+                "time": hhmm,
+                "tz_offset": d.get("tz_offset", 8),
+                "by": q.from_user.id,
+                "report_chat": q.message.chat_id,
+                "status": "pending",
+            }
+            save_data(d)
+            register_daily(context.application.job_queue, jid, hhmm, d.get("tz_offset", 8))
+            context.user_data.pop("flow", None)
+            await show(
+                update,
+                f"✅ 已设置每日定时\n任务号：<code>{jid}</code>\n每天 {hhmm}（{fmt_offset(d)}）自动群发\n\n"
+                "想停止：「⏰ 定时任务」→「🛑 取消定时」",
+                kb([[btn("⏰ 查看定时任务", "bc:jobs")], [btn("🏠 主菜单", "bc:menu")]]),
+            )
+        elif flow.get("when") is None:
             context.application.create_task(
                 run_now_task(context.bot, flow["cid"], flow["sid"], q.message.chat_id)
             )
@@ -931,7 +1012,19 @@ async def on_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if dt <= datetime.now(tz):
             await msg.reply_text("这个时间已经过了，请重新输入")
             return
-        get_flow(context)["when"] = dt.isoformat()
+        flow = get_flow(context)
+        flow["when"] = dt.isoformat()
+        flow["daily"] = None
+        await screen_confirm(update, context)
+
+    elif mode == "time_daily":
+        hhmm = parse_hhmm(text)
+        if hhmm is None:
+            await msg.reply_text("格式不对，请重新输入，例如：20:30 或 2030")
+            return
+        flow = get_flow(context)
+        flow["daily"] = hhmm
+        flow["when"] = None
         await screen_confirm(update, context)
 
 
@@ -986,7 +1079,18 @@ async def post_init(application):
     now = datetime.now(get_tz(d))
     changed = False
     for jid, job in d["jobs"].items():
-        if job["status"] == "pending":
+        if job.get("repeat") == "daily" and job["status"] in ("pending", "running"):
+            # 每日任务：重启后无条件重新注册，明天照常发
+            if job["status"] == "running":
+                job["status"] = "pending"
+                changed = True
+                await notify(
+                    application.bot, job.get("report_chat", job["by"]),
+                    f"⚠️ 每日任务 <code>{jid}</code> 执行中 Bot 重启了，今天可能只发了一部分，请检查。明天起照常发送。",
+                )
+            register_daily(application.job_queue, jid, job["time"], job.get("tz_offset", 8))
+            logger.info("已恢复每日任务 %s 每天 %s", jid, job["time"])
+        elif job["status"] == "pending":
             run_at = datetime.fromisoformat(job["run_at"])
             if run_at > now:
                 application.job_queue.run_once(scheduled_cb, when=run_at, name=jid, data=jid)
