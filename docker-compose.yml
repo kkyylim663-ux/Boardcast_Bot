@@ -1,0 +1,8 @@
+services:
+  broadcast-bot:
+    build: .
+    container_name: broadcast-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
