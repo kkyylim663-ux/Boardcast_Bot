@@ -241,6 +241,9 @@ async def send_report(bot, fallback_chat, text):
     try:
         t = load_data().get("report_target")
         if not t:
+            if fallback_chat is None:  # 群名单变动这类后台通知：没设固定位置就只写日志，不打扰任何群
+                logger.info("未设置固定报告位置，仅记日志：%s", text.replace("\n", " "))
+                return
             await notify(bot, fallback_chat, text)
             return
         try:
@@ -250,7 +253,8 @@ async def send_report(bot, fallback_chat, text):
             )
         except (BadRequest, Forbidden):
             logger.exception("固定报告位置发送失败，改发到操作所在聊天")
-            await notify(bot, fallback_chat, text + "\n\n⚠️ 固定话题发送失败，已改发到这里，请重新 /setreport")
+            if fallback_chat is not None:
+                await notify(bot, fallback_chat, text + "\n\n⚠️ 固定话题发送失败，已改发到这里，请重新 /setreport")
     except Exception:
         logger.exception("发送报告失败")
 
@@ -283,6 +287,65 @@ def unregister_chat(chat_id):
     save_data(d)
 
 
+def migrate_chat(old_id, new_id):
+    """普通群升级成超级群后 ID 会变：把旧 ID 换成新 ID（名单、分类、报告位置、脚本源都跟着换）。
+    返回群名；旧 ID 本来就不在记录里（已经换过了）则返回 None。"""
+    d = load_data()
+    old_key, new_key = str(old_id), str(new_id)
+    changed = False
+    title = d["chats"].pop(old_key, None)
+    if title is not None:
+        d["chats"][new_key] = d["chats"].get(new_key, title)
+        changed = True
+    for cat in d["categories"].values():
+        if old_id in cat["chats"]:
+            cat["chats"] = list(dict.fromkeys(new_id if c == old_id else c for c in cat["chats"]))
+            changed = True
+    rt = d.get("report_target")
+    if rt and rt.get("chat_id") == old_id:
+        rt["chat_id"] = new_id
+        changed = True
+    for j in d["jobs"].values():
+        if j.get("report_chat") == old_id:
+            j["report_chat"] = new_id
+            changed = True
+    for s in d["scripts"].values():
+        if s.get("chat_id") == old_id:
+            s["chat_id"] = new_id
+            changed = True
+    if not changed:
+        return None
+    save_data(d)
+    _seen_chats.pop(old_id, None)
+    if title is not None:
+        _seen_chats[new_id] = title
+    logger.info("群已升级成超级群：%s -> %s（%s）", old_id, new_id, title)
+    return title or str(old_id)
+
+
+async def announce_migration(bot, title):
+    await send_report(
+        bot, None,
+        f"🔁 群「{esc(title)}」已升级成超级群，已自动换成新 ID，分类里的勾选保持不变",
+    )
+
+
+async def on_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """群升级成超级群的服务消息：旧群那条带 migrate_to_chat_id，新群那条带 migrate_from_chat_id。"""
+    msg = update.effective_message
+    if msg is None:
+        return
+    if msg.migrate_to_chat_id:
+        old_id, new_id = msg.chat_id, msg.migrate_to_chat_id
+    elif msg.migrate_from_chat_id:
+        old_id, new_id = msg.migrate_from_chat_id, msg.chat_id
+    else:
+        return
+    title = migrate_chat(old_id, new_id)
+    if title:
+        await announce_migration(context.bot, title)
+
+
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cm = update.my_chat_member
     chat = cm.chat
@@ -293,11 +356,27 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         register_chat(chat)
         logger.info("已登记：%s (%s)", chat.title, chat.id)
     elif status in ("left", "kicked"):
+        # 先确认不是「群升级」造成的（升级的话旧群也会显示 Bot 离开）：升级就换 ID，不删
+        try:
+            await context.bot.get_chat_member(chat.id, context.bot.id)
+        except ChatMigrated as e:
+            title = migrate_chat(chat.id, e.new_chat_id)
+            if title:
+                await announce_migration(context.bot, title)
+            return
+        except Exception:
+            pass
+        title = load_data()["chats"].get(str(chat.id))  # 名单里本来就没有的群，不用通知
         unregister_chat(chat.id)
         logger.info("已移除：%s (%s)", chat.title, chat.id)
+        if title:
+            await send_report(context.bot, None, f"🧹 Bot 已不在群「{esc(title)}」，已从名单移除")
 
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is not None and (msg.migrate_to_chat_id or msg.migrate_from_chat_id):
+        return  # 升级服务消息交给 on_migrate，别把旧 ID 又登记回来
     chat = update.effective_chat
     if chat:
         register_chat(chat)
@@ -309,6 +388,68 @@ async def register_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     register_chat(chat)
     await update.message.reply_text(f"✅ 已登记本群：{chat.title}")
+
+
+_gone_strikes = {}  # {chat_id: 连续「不在」次数}，只存内存
+
+
+async def refresh_chats(bot, immediate=False):
+    """逐个问 Telegram：Bot 还在不在这个群。返回 (被移除的群名, 升级后换了 ID 的群名)。
+    immediate=False（自动检查）：连续 2 次都「不在」才删，防误删；immediate=True（手动点刷新）：查到不在就删。
+    网络超时、限流这类临时错误一律保留，不会误删。"""
+    d = load_data()
+    removed, migrated = [], []
+    for key, title in list(d["chats"].items()):
+        chat_id = int(key)
+        gone = False
+        try:
+            member = await bot.get_chat_member(chat_id, bot.id)
+            gone = member.status in ("left", "kicked")
+        except ChatMigrated as e:  # 群升级成超级群：换 ID，不算「不在」
+            t = migrate_chat(chat_id, e.new_chat_id)
+            if t:
+                migrated.append(t)
+            _gone_strikes.pop(chat_id, None)
+            continue
+        except RetryAfter as e:
+            await asyncio.sleep(_secs(e.retry_after) + 1)
+            continue
+        except Forbidden:
+            gone = True
+        except BadRequest as e:
+            if "chat not found" not in str(e).lower():
+                continue
+            gone = True
+        except TelegramError:
+            continue
+        if not gone:
+            _gone_strikes.pop(chat_id, None)
+        else:
+            _gone_strikes[chat_id] = _gone_strikes.get(chat_id, 0) + 1
+            if immediate or _gone_strikes[chat_id] >= 2:
+                unregister_chat(chat_id)
+                _gone_strikes.pop(chat_id, None)
+                removed.append(title)
+        await asyncio.sleep(0.05)
+    return removed, migrated
+
+
+async def auto_refresh(bot):
+    """后台检查一遍；有变动才通知（发到固定报告话题，没设就只写日志）。"""
+    try:
+        removed, migrated = await refresh_chats(bot)
+    except Exception:
+        logger.exception("检查群名单出错")
+        return
+    lines = [f"🔁 群「{esc(t)}」已升级成超级群，已自动换成新 ID，分类里的勾选保持不变" for t in migrated]
+    if removed:
+        lines.append("🧹 Bot 已不在这些群，已从名单移除：" + "、".join(esc(t) for t in removed))
+    if lines:
+        await send_report(bot, None, "\n".join(lines))
+
+
+async def refresh_job(context: ContextTypes.DEFAULT_TYPE):
+    await auto_refresh(context.bot)
 
 
 # ---------- 发送核心 ----------
@@ -358,10 +499,11 @@ async def broadcast_result(bot, cid, sid) -> dict:
     for chat_id in list(cat["chats"]):
         name = d["chats"].get(str(chat_id), str(chat_id))
         last_err = None
+        target = chat_id
         for _ in range(2):
             try:
                 await bot.copy_message(
-                    chat_id=chat_id,
+                    chat_id=target,
                     from_chat_id=script["chat_id"],
                     message_id=script["message_id"],
                 )
@@ -371,8 +513,12 @@ async def broadcast_result(bot, cid, sid) -> dict:
                 last_err = e
                 await asyncio.sleep(_secs(e.retry_after) + 1)
             except ChatMigrated as e:
+                # 群升级成超级群：换 ID，并用新 ID 立刻重发一次
                 last_err = e
-                break
+                t = migrate_chat(target, e.new_chat_id)
+                if t:
+                    await announce_migration(bot, t)
+                target = e.new_chat_id
             except TelegramError as e:
                 last_err = e
                 break
@@ -680,19 +826,21 @@ async def screen_confirm(update, context):
 
 
 # ---------- 界面：分类管理 ----------
-async def screen_cats(update, context):
+async def screen_cats(update, context, notice=""):
     context.user_data.pop("await", None)
     d = load_data()
     rows = [
         [btn(f"🗂 {short(c['name'])}（{len(c['chats'])}群）", f"bc:ce:{cid}:0")]
         for cid, c in d["categories"].items()
     ]
-    rows.append([btn("➕ 新建分类", "bc:cnew")])
+    rows.append([btn("➕ 新建分类", "bc:cnew"), btn("🔄 刷新群列表", "bc:rf:-")])
     back = "bc:new" if context.user_data.get("flow") is not None else "bc:menu"
     rows.append([btn("⬅ 返回", back)])
     text = "🗂 <b>群组分类</b>\n\n点分类可勾选里面的群"
     if not d["chats"]:
         text += "\n\n⚠️ 还没登记任何群：把 Bot 拉进群，或在群里发 /register"
+    if notice:
+        text += f"\n\n{notice}"
     await show(update, text, kb(rows))
 
 
@@ -721,6 +869,7 @@ async def screen_cat_edit(update, context, cid, page=0, notice=""):
             nav.append(btn("▶", f"bc:ce:{cid}:{page + 1}"))
         rows.append(nav)
     rows.append([btn("✏️ 改名", f"bc:cren:{cid}"), btn("🗑 删除", f"bc:cdel:{cid}")])
+    rows.append([btn("🔄 刷新群列表", f"bc:rf:{cid}:{page}")])
     if context.user_data.get("flow") is not None:
         rows.append([btn("✅ 完成，下一步", f"bc:fc:{cid}")])
     else:
@@ -934,6 +1083,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- 分类 ----
     elif act == "cats":
         await screen_cats(update, context)
+    elif act == "rf":
+        # 手动刷新：立刻问 Telegram 每个群 Bot 还在不在，不在就删，升级成超级群的换 ID
+        removed, migrated = await refresh_chats(context.bot, immediate=True)
+        notes = [f"🔁 「{esc(t)}」已升级成超级群，已自动换成新 ID" for t in migrated]
+        if removed:
+            notes.append("🧹 已移除 Bot 不在的群：" + "、".join(esc(t) for t in removed))
+        note = "\n".join(notes) if notes else "🔄 已刷新：所有群 Bot 都还在 ✅"
+        if p[2] == "-":
+            await screen_cats(update, context, note)
+        else:
+            await screen_cat_edit(update, context, p[2], int(p[3]), note)
     elif act == "cnew":
         set_await(context, "cat_new", q.message.chat_id)
         await show(update, "请输入新分类的名称：", kb([[btn("❌ 取消", "bc:cats")]]))
@@ -1330,9 +1490,13 @@ app.add_handler(CommandHandler("setreport", setreport_cmd, filters=PRIVATE | GRO
 app.add_handler(CommandHandler("clearreport", clearreport_cmd, filters=PRIVATE | GROUPS))
 app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^bc:"))
 app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, on_migrate))  # 必须排在 on_admin_message 前面
 app.add_handler(MessageHandler((PRIVATE | GROUPS) & ~filters.COMMAND, on_admin_message))
 app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message), group=1)
 app.add_error_handler(on_error)
+
+# 群名单自查：启动 10 秒后第一次，之后每 10 分钟一次（连续 2 次确认不在才删）
+app.job_queue.run_repeating(refresh_job, interval=600, first=10)
 
 logger.info("群发 Bot 已启动，正在监听消息...")
 app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
