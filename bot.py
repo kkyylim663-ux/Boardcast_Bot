@@ -9,7 +9,9 @@ from datetime import time as dtime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ChatType
-from telegram.error import BadRequest, RetryAfter, TelegramError
+from telegram.error import (
+    BadRequest, RetryAfter, TelegramError, Forbidden, ChatMigrated, TimedOut, NetworkError,
+)
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
     ChatMemberHandler, ContextTypes, filters,
@@ -51,6 +53,8 @@ DEFAULT_DATA = {
     "categories": {},  # {"c1": {"name": "..", "chats": [chat_id, ...]}}
     "scripts": {},     # {"s2": {"name": "..", "preview": "..", "chat_id": 私聊ID, "message_id": 消息ID}}
     "jobs": {},        # {"j3": {cid, sid, cat_name, script_name, run_at, by, status}}
+    "report_target": None,  # 固定报告位置 {"chat_id", "thread_id", "title"}，None = 发在操作所在聊天
+    "run_log": [],     # 定时任务运行记录（每日汇总用），只保留 3 天
 }
 
 
@@ -219,6 +223,38 @@ async def notify(bot, chat_id, text):
         logger.exception("通知 %s 失败", chat_id)
 
 
+def report_where(d) -> str:
+    """报告发到哪里（HTML 用）：固定位置的群名 / 话题，未设置时是「操作所在聊天」。"""
+    t = d.get("report_target")
+    if not t:
+        return "操作所在聊天"
+    return esc(t["title"]) + (" / 话题" if t.get("thread_id") else "")
+
+
+def report_line(d) -> str:
+    """设置了固定报告位置时，在「开始发送」的提示里附一行说明。"""
+    return f"\n📋 报告将发到：{report_where(d)}" if d.get("report_target") else ""
+
+
+async def send_report(bot, fallback_chat, text):
+    """群发 / 定时报告：有固定位置就发到那里，发不了就退回到操作所在的聊天。"""
+    try:
+        t = load_data().get("report_target")
+        if not t:
+            await notify(bot, fallback_chat, text)
+            return
+        try:
+            await bot.send_message(
+                chat_id=t["chat_id"], text=text,
+                message_thread_id=t.get("thread_id"), parse_mode="HTML",
+            )
+        except (BadRequest, Forbidden):
+            logger.exception("固定报告位置发送失败，改发到操作所在聊天")
+            await notify(bot, fallback_chat, text + "\n\n⚠️ 固定话题发送失败，已改发到这里，请重新 /setreport")
+    except Exception:
+        logger.exception("发送报告失败")
+
+
 # ---------- 群登记 ----------
 _seen_chats = {}  # 内存缓存，避免群里每条消息都读写磁盘
 
@@ -280,12 +316,42 @@ def _secs(ra):
     return ra.total_seconds() if isinstance(ra, timedelta) else float(ra)
 
 
-async def do_broadcast(bot, cid, sid) -> str:
+def explain_error(e) -> str:
+    """把发送时的报错翻译成管理员看得懂的原因。"""
+    s = str(e).lower()
+    if isinstance(e, ChatMigrated):
+        return "群已升级成超级群，请重新登记"
+    if "topic_closed" in s or "topic closed" in s:
+        return "该群话题已关闭"
+    if isinstance(e, Forbidden):
+        if "kicked" in s:
+            return "Bot 已被踢出群"
+        if any(k in s for k in ("not enough rights", "write_forbidden", "muted", "have no rights")):
+            return "Bot 没有发言权限（仅管理员发言 / 被禁言）"
+        return "Bot 已被踢出群或无权限"
+    if isinstance(e, BadRequest):
+        if "chat not found" in s:
+            return "找不到这个群（已解散或 Bot 不在）"
+        if "message to copy not found" in s or "message_id_invalid" in s:
+            return "脚本原消息已被删除，请重新保存脚本"
+        return str(e)[:80]
+    if isinstance(e, RetryAfter):
+        return "被 Telegram 限流"
+    if isinstance(e, (TimedOut, NetworkError)):
+        return "网络超时"
+    return str(e)[:80]
+
+
+async def broadcast_result(bot, cid, sid) -> dict:
     d = load_data()
     cat = d["categories"].get(cid)
     script = d["scripts"].get(sid)
     if not cat or not script:
-        return "❌ 分类或脚本已被删除，未发送"
+        return {
+            "ok": False, "error": "分类或脚本已被删除，未发送",
+            "cat_name": cat["name"] if cat else "", "script_name": script["name"] if script else "",
+            "total": 0, "ok_count": 0, "fails": [],
+        }
 
     ok = 0
     fails = []
@@ -304,27 +370,45 @@ async def do_broadcast(bot, cid, sid) -> str:
             except RetryAfter as e:
                 last_err = e
                 await asyncio.sleep(_secs(e.retry_after) + 1)
+            except ChatMigrated as e:
+                last_err = e
+                break
             except TelegramError as e:
                 last_err = e
                 break
         if last_err is None:
             ok += 1
         else:
-            fails.append((name, str(last_err)))
+            fails.append({"chat_id": chat_id, "name": name, "reason": explain_error(last_err)})
         await asyncio.sleep(0.1)  # 避免触发限流
 
+    return {
+        "ok": True, "error": None,
+        "cat_name": cat["name"], "script_name": script["name"],
+        "total": len(cat["chats"]), "ok_count": ok,
+        "fails": fails,
+    }
+
+
+def format_report(r) -> str:
+    if not r["ok"]:
+        return f"❌ {r['error']}"
     lines = [
         "📢 <b>群发完成</b>",
-        f"分类：{esc(cat['name'])}",
-        f"脚本：{esc(script['name'])}",
-        f"✅ 成功：{ok}",
-        f"❌ 失败：{len(fails)}",
+        f"分类：{esc(r['cat_name'])}",
+        f"脚本：{esc(r['script_name'])}",
+        f"✅ 成功：{r['ok_count']}",
+        f"❌ 失败：{len(r['fails'])}",
     ]
-    for name, err in fails[:15]:
-        lines.append(f"  • {esc(name)}：{esc(err)[:80]}")
-    if len(fails) > 15:
-        lines.append(f"  …还有 {len(fails) - 15} 个失败")
+    for f in r["fails"][:15]:
+        lines.append(f"  • {esc(f['name'])}：{esc(f['reason'][:80])}")
+    if len(r["fails"]) > 15:
+        lines.append(f"  …还有 {len(r['fails']) - 15} 个失败")
     return "\n".join(lines)
+
+
+async def do_broadcast(bot, cid, sid) -> str:
+    return format_report(await broadcast_result(bot, cid, sid))
 
 
 def drop_temp_script(sid):
@@ -343,7 +427,7 @@ async def run_now_task(bot, cid, sid, report_chat):
         logger.exception("群发出错")
         report = "❌ 群发过程出错，请查看日志"
     drop_temp_script(sid)
-    await notify(bot, report_chat, report)
+    await send_report(bot, report_chat, report)
 
 
 async def scheduled_cb(context: ContextTypes.DEFAULT_TYPE):
@@ -353,23 +437,113 @@ async def scheduled_cb(context: ContextTypes.DEFAULT_TYPE):
     if not job or job["status"] != "pending":
         return
     daily = job.get("repeat") == "daily"
+    chat = job.get("report_chat", job["by"])
     job["status"] = "running"
     save_data(d)
     status = "pending" if daily else "done"  # 每日任务发完回到 pending，明天继续
     try:
-        report = await do_broadcast(context.bot, job["cid"], job["sid"])
+        result = await broadcast_result(context.bot, job["cid"], job["sid"])
     except Exception:
         logger.exception("定时任务 %s 出错", jid)
-        report = "❌ 群发过程出错，请查看日志"
+        result = {"ok": False, "error": "群发过程出错，请查看日志", "total": 0,
+                  "ok_count": 0, "fails": []}
         status = "pending" if daily else "failed"
+
     d = load_data()
+    now = datetime.now(get_tz(d))
     if jid in d["jobs"] and d["jobs"][jid]["status"] == "running":
         d["jobs"][jid]["status"] = status
-        save_data(d)
+    # 运行记录：给每日汇总用，只保留 3 天
+    d["run_log"].append({
+        "date": now.strftime("%Y-%m-%d"),
+        "jid": jid,
+        "kind": "daily" if daily else "once",
+        "cat_name": job["cat_name"],
+        "script_name": job["script_name"],
+        "time": job.get("time") or datetime.fromisoformat(job["run_at"]).strftime("%H:%M"),
+        "total": result["total"],
+        "ok": result["ok_count"],
+        "fails": result["fails"],
+        "error": result["error"],
+        "summarized": False,
+    })
+    cutoff = (now - timedelta(days=3)).strftime("%Y-%m-%d")
+    d["run_log"] = [e for e in d["run_log"] if e["date"] >= cutoff]
+    save_data(d)
     if not daily:
         drop_temp_script(job["sid"])
-    title = f"🔁 每日任务 <code>{jid}</code>（每天 {job.get('time')}）已执行" if daily else f"⏰ 定时任务 <code>{jid}</code> 已执行"
-    await notify(context.bot, job.get("report_chat", job["by"]), f"{title}\n\n{report}")
+
+    # 全部成功：不打扰，只记日志（当天汇总会统一发）；有失败：立即报警
+    fails = result["fails"]
+    if result["ok"] and not fails:
+        logger.info("定时任务 %s 全部发送成功（%d 个群）", jid, result["ok_count"])
+    else:
+        where = f"每天 {job.get('time')}" if daily else "单次"
+        head = f"⚠️ 任务 <code>{jid}</code>（{where}）{esc(job['cat_name'])} → {esc(job['script_name'])}"
+        if not result["ok"]:
+            lines = [f"{head}：{esc(result['error'])}"]
+        else:
+            lines = [f"{head}：{len(fails)} 个群失败"]
+            for f in fails[:30]:
+                lines.append(f"• {esc(f['name'])}：{esc(f['reason'])}")
+            if len(fails) > 30:
+                lines.append(f"…还有 {len(fails) - 30} 个")
+        await send_report(context.bot, chat, "\n".join(lines))
+
+    await maybe_send_daily_summary(context.bot, chat, jid)
+
+
+async def maybe_send_daily_summary(bot, fallback_chat, jid=None):
+    """今天的定时任务都跑完后，只发一条汇总；还有没跑完的，就等最后一个再发。"""
+    d = load_data()
+    tz = get_tz(d)
+    now = datetime.now(tz)
+    today = now.strftime("%Y-%m-%d")
+    hm = now.strftime("%H:%M")
+    for other, j in d["jobs"].items():
+        if other == jid or j["status"] not in ("pending", "running"):
+            continue
+        if j["status"] == "running":
+            return
+        if j.get("repeat") == "daily":
+            already_ran = any(e["jid"] == other and e["date"] == today for e in d["run_log"])
+            if j["time"] > hm or (j["time"] == hm and not already_ran):
+                return
+        else:
+            run_local = datetime.fromisoformat(j["run_at"]).astimezone(tz)
+            if run_local > now and run_local.strftime("%Y-%m-%d") == today:
+                return
+
+    entries = [e for e in d["run_log"] if e["date"] == today and not e["summarized"]]
+    if not entries:
+        return
+    fail_lines = []
+    for e in entries:
+        if e["error"]:
+            fail_lines.append(f"• {esc(e['cat_name'])}（{esc(e['script_name'])}）：{esc(e['error'])}")
+        for f in e["fails"]:
+            fail_lines.append(f"• {esc(f['name'])}（{esc(e['cat_name'])}）：{esc(f['reason'])}")
+    sum_total = sum(e["total"] for e in entries)
+    sum_ok = sum(e["ok"] for e in entries)
+    sum_fail = len(fail_lines)
+    lines = [
+        f"📊 <b>今日群发汇总</b>（{today}）",
+        f"任务 {len(entries)} 个｜发送 {sum_total} 次｜成功 {sum_ok}｜失败 {sum_fail}",
+    ]
+    if sum_fail == 0:
+        lines.append("🎉 今天全部成功")
+    else:
+        lines.append("❌ 失败的群：")
+        lines += fail_lines[:30]
+        if sum_fail > 30:
+            lines.append(f"…还有 {sum_fail - 30} 个")
+    await send_report(bot, fallback_chat, "\n".join(lines))
+
+    d = load_data()
+    for e in d["run_log"]:
+        if e["date"] == today:
+            e["summarized"] = True
+    save_data(d)
 
 
 # ---------- 界面：主菜单 ----------
@@ -384,7 +558,8 @@ async def screen_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"分类：{len(d['categories'])} 个\n"
         f"脚本：{len(d['scripts'])} 个\n"
         f"待执行定时：{pending} 个\n"
-        f"时区：{fmt_offset(d)}"
+        f"时区：{fmt_offset(d)}\n"
+        f"📍 报告位置：{report_where(d)}"
     )
     rows = [
         [btn("📢 开始群发", "bc:new")],
@@ -663,7 +838,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 run_now_task(context.bot, flow["cid"], flow["sid"], q.message.chat_id)
             )
             context.user_data.pop("flow", None)
-            await show(update, "⏳ 已开始发送，完成后会在这里回报结果。", kb([[btn("🏠 主菜单", "bc:menu")]]))
+            await show(update, "⏳ 已开始发送，完成后会回报结果。" + report_line(d), kb([[btn("🏠 主菜单", "bc:menu")]]))
         elif p[2] == "daily":
             d = load_data()
             script = d["scripts"].get(flow["sid"])
@@ -730,7 +905,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 run_now_task(context.bot, flow["cid"], flow["sid"], q.message.chat_id)
             )
             context.user_data.pop("flow", None)
-            await show(update, "⏳ 已开始发送，完成后会通知你。", kb([[btn("🏠 主菜单", "bc:menu")]]))
+            await show(update, "⏳ 已开始发送，完成后会回报结果。" + report_line(d), kb([[btn("🏠 主菜单", "bc:menu")]]))
         else:
             run_at = datetime.fromisoformat(flow["when"])
             if run_at <= datetime.now(get_tz(d)):
@@ -1061,6 +1236,29 @@ async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"你的用户ID：{update.effective_user.id}")
 
 
+async def setreport_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user):
+        return
+    msg = update.message
+    chat = update.effective_chat
+    thread_id = msg.message_thread_id if msg.is_topic_message else None
+    title = chat.title or "私聊"
+    d = load_data()
+    d["report_target"] = {"chat_id": chat.id, "thread_id": thread_id, "title": title}
+    save_data(d)
+    where = title + (" / 话题" if thread_id else "")
+    await msg.reply_text(f"✅ 以后群发/定时报告都会发到：{where}")
+
+
+async def clearreport_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user):
+        return
+    d = load_data()
+    d["report_target"] = None
+    save_data(d)
+    await update.message.reply_text("✅ 已取消固定报告位置，恢复发在操作所在的聊天")
+
+
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
     logger.error("处理更新时出错", exc_info=context.error)
 
@@ -1072,6 +1270,8 @@ async def post_init(application):
         BotCommand("broadcast", "打开群发菜单"),
         BotCommand("tz", "设置时区，如 /tz +8"),
         BotCommand("myid", "查看我的用户ID"),
+        BotCommand("setreport", "把报告固定发到本群/话题（管理员）"),
+        BotCommand("clearreport", "取消固定报告位置"),
     ])
 
     # 重启后恢复定时任务
@@ -1084,7 +1284,7 @@ async def post_init(application):
             if job["status"] == "running":
                 job["status"] = "pending"
                 changed = True
-                await notify(
+                await send_report(
                     application.bot, job.get("report_chat", job["by"]),
                     f"⚠️ 每日任务 <code>{jid}</code> 执行中 Bot 重启了，今天可能只发了一部分，请检查。明天起照常发送。",
                 )
@@ -1098,7 +1298,7 @@ async def post_init(application):
             else:
                 job["status"] = "missed"
                 changed = True
-                await notify(
+                await send_report(
                     application.bot, job.get("report_chat", job["by"]),
                     f"⚠️ 定时任务 <code>{jid}</code>（{esc(job['cat_name'])} → {esc(job['script_name'])}）"
                     f"在 Bot 离线期间错过了发送时间，未发送。",
@@ -1106,7 +1306,7 @@ async def post_init(application):
         elif job["status"] == "running":
             job["status"] = "interrupted"
             changed = True
-            await notify(
+            await send_report(
                 application.bot, job.get("report_chat", job["by"]),
                 f"⚠️ 定时任务 <code>{jid}</code> 执行中 Bot 重启了，可能只发了一部分，请检查。",
             )
@@ -1126,6 +1326,8 @@ app.add_handler(CommandHandler(["start", "broadcast"], start_cmd, filters=PRIVAT
 app.add_handler(CommandHandler("tz", tz_cmd, filters=PRIVATE))
 app.add_handler(CommandHandler("myid", myid_cmd, filters=PRIVATE))
 app.add_handler(CommandHandler("register", register_cmd, filters=filters.ChatType.GROUPS))
+app.add_handler(CommandHandler("setreport", setreport_cmd, filters=PRIVATE | GROUPS))
+app.add_handler(CommandHandler("clearreport", clearreport_cmd, filters=PRIVATE | GROUPS))
 app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^bc:"))
 app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 app.add_handler(MessageHandler((PRIVATE | GROUPS) & ~filters.COMMAND, on_admin_message))
